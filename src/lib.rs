@@ -43,6 +43,7 @@ impl<E: embedded_io_async::Error> embedded_io_async::Error for Error<E> {
             | Error::Read(request::ReadError::UnexpectedEof) => {
                 embedded_io_async::ErrorKind::InvalidData
             }
+            Error::Read(request::ReadError::BufferTooSmall) => embedded_io_async::ErrorKind::OutOfMemory,
             Error::Read(request::ReadError::Other(err)) | Error::Write(err) => err.kind(),
         }
     }
@@ -201,7 +202,7 @@ async fn serve_and_shutdown<State, T: Timer, P: routing::PathRouter<State>, S: i
                 .run_with_maybe_timeout(config.timeouts.read_request.clone(), reader.read())
                 .await
             {
-                Ok(Ok((request, connection))) => {
+                Ok(Ok((request, body_reader))) => {
                     let connection_header = match config.connection {
                         KeepAlive::Close => KeepAlive::Close,
                         KeepAlive::KeepAlive => {
@@ -221,11 +222,9 @@ async fn serve_and_shutdown<State, T: Timer, P: routing::PathRouter<State>, S: i
                             routing::NoPathParameters,
                             request.path(),
                             request,
-                            response::ResponseStream::new(
-                                connection,
-                                &mut writer,
-                                connection_header,
-                            ),
+                            body_reader,
+                            &mut writer,
+                            response::ResponseStream::new(connection_header),
                         )
                         .await?;
 
@@ -242,6 +241,9 @@ async fn serve_and_shutdown<State, T: Timer, P: routing::PathRouter<State>, S: i
                             Error::Read(request::ReadError::UnexpectedEof)
                         }
                         request::ReadError::Other(err) => err,
+                        request::ReadError::BufferTooSmall => {
+                            Error::Read(request::ReadError::BufferTooSmall)
+                        }
                     })
                 }
                 Err(..) => return Err(Error::ReadTimeout),

@@ -4,7 +4,7 @@ use core::fmt;
 
 use crate::{
     io::{Read, Write},
-    request::Path,
+    request::{self, Path},
     routing::{PathRouter, RequestHandler},
     ResponseSent,
 };
@@ -118,13 +118,19 @@ impl<H: HeadersIter> File<H> {
 }
 
 impl<State, PathParameters, H: HeadersIter + Clone> crate::routing::RequestHandler<State, PathParameters> for File<H> {
-    async fn call_request_handler<W: super::ResponseWriter>(
+    async fn call_request_handler<
+        R: Read,
+        WW: Write<Error = R::Error>,
+        W: super::ResponseWriter,
+    >(
         &self,
-        _state: &State,
-        _path_parameters: PathParameters,
-        request: crate::request::Request<'_>,
+        state: &State,
+        path_parameters: PathParameters,
+        request: request::Request<'_>,
+        body_reader: R,
+        writer: WW,
         response_writer: W,
-    ) -> Result<ResponseSent, W::Error> {
+    ) -> Result<ResponseSent, R::Error> {
         if let Some(if_none_match) = request.headers().get("If-None-Match") {
             if if_none_match
                 .split(',')
@@ -132,16 +138,22 @@ impl<State, PathParameters, H: HeadersIter + Clone> crate::routing::RequestHandl
                 .any(|etag| self.etag == etag)
             {
                 return response_writer
-                    .write_response(super::Response {
-                        status_code: status::NOT_MODIFIED,
-                        headers: self.etag.clone(),
-                        body: super::NoBody,
-                    })
+                    .write_response(
+                        writer,
+                        super::Connection(body_reader),
+                        super::Response {
+                            status_code: status::NOT_MODIFIED,
+                            headers: self.etag.clone(),
+                            body: super::NoBody,
+                        },
+                    )
                     .await;
             }
         }
 
-        self.clone().write_to(response_writer).await
+        self.clone()
+            .write_to(writer, super::Connection(body_reader), response_writer)
+            .await
     }
 }
 
@@ -164,11 +176,15 @@ impl<H: HeadersIter> super::Content for File<H> {
 }
 
 impl<H: HeadersIter> super::IntoResponse for File<H> {
-    async fn write_to<W: super::ResponseWriter>(
+    async fn write_to<R: Read, W: super::ResponseWriter, WW: Write<Error = R::Error>>(
         self,
+        writer: WW,
+        connection: super::Connection<R>,
         response_writer: W,
-    ) -> Result<ResponseSent, W::Error> {
-        response_writer.write_response(self.into_response()).await
+    ) -> Result<ResponseSent, R::Error> {
+        response_writer
+            .write_response(writer, connection, self.into_response())
+            .await
     }
 }
 
@@ -213,23 +229,39 @@ impl<H: HeadersIter> Directory<H> {
 }
 
 impl<State, CurrentPathParameters, H: HeadersIter + Clone> PathRouter<State, CurrentPathParameters> for Directory<H> {
-    async fn call_path_router<W: super::ResponseWriter>(
+    async fn call_path_router<R: Read, WW: Write<Error = R::Error>, W: super::ResponseWriter>(
         &self,
         state: &State,
         current_path_parameters: CurrentPathParameters,
         path: Path<'_>,
-        request: crate::request::Request<'_>,
+        request: request::Request<'_>,
+        body_reader: R,
+        writer: WW,
         response_writer: W,
-    ) -> Result<ResponseSent, W::Error> {
+    ) -> Result<ResponseSent, R::Error> {
         if !request.method().eq_ignore_ascii_case("get") {
             return crate::routing::MethodNotAllowed
-                .call_request_handler(state, current_path_parameters, request, response_writer)
+                .call_request_handler(
+                    state,
+                    current_path_parameters,
+                    request,
+                    body_reader,
+                    writer,
+                    response_writer,
+                )
                 .await;
         }
 
         if let Some(file) = self.matching_file(request.path()) {
-            file.call_request_handler(state, current_path_parameters, request, response_writer)
-                .await
+            file.call_request_handler(
+                state,
+                current_path_parameters,
+                request,
+                body_reader,
+                writer,
+                response_writer,
+            )
+            .await
         } else {
             crate::routing::NotFound
                 .call_path_router(
@@ -237,6 +269,8 @@ impl<State, CurrentPathParameters, H: HeadersIter + Clone> PathRouter<State, Cur
                     current_path_parameters,
                     path,
                     request,
+                    body_reader,
+                    writer,
                     response_writer,
                 )
                 .await
